@@ -1,42 +1,42 @@
 """
-雙 Agent 資訊整理機器人 (Google Gemini 版)
-- Agent 1: 科技新聞 (Gemini + Google Search Grounding)
-- Agent 2: arXiv AI 最新論文 (Gemini + Google Search Grounding)
+雙 Agent 資訊整理機器人 (Tavily + arXiv 官方 API 版)
+- Agent 1: 科技新聞 (Tavily 搜尋 + Gemini 整理)
+- Agent 2: arXiv AI 論文 (arXiv 官方 API，完全免費即時)
 - 結果透過 Discord Webhook 傳送
+
+取得免費 API Key:
+  Gemini : https://aistudio.google.com/apikey
+  Tavily : https://tavily.com
 """
 
 import os
 import json
 import re
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-# ============================================================
-# 設定區（從環境變數讀取，不要直接寫在這裡）
-# ============================================================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-NEWS_COUNT = 8
+NEWS_COUNT  = 8
 PAPER_COUNT = 8
-MODEL = "gemini-2.0-flash"
-# ============================================================
+MODEL       = "gemini-2.0-flash"
 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 
 def call_gemini(system_prompt: str, user_prompt: str) -> str:
-    """呼叫 Gemini API，啟用 Google Search Grounding"""
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
     }
-
     resp = requests.post(
         GEMINI_URL,
         params={"key": GEMINI_API_KEY},
@@ -44,10 +44,8 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
         headers={"Content-Type": "application/json"},
         timeout=60,
     )
-
     if resp.status_code != 200:
         raise RuntimeError(f"Gemini API 錯誤 {resp.status_code}: {resp.text[:300]}")
-
     data = resp.json()
     try:
         return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -56,29 +54,88 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
 
 
 def parse_json_from_text(text: str) -> list:
-    """從文字中提取 JSON 陣列"""
     text = re.sub(r"```json|```", "", text).strip()
     match = re.search(r"\[[\s\S]*\]", text)
     if not match:
-        raise ValueError(f"無法解析 JSON，回應內容: {text[:400]}")
+        raise ValueError(f"無法解析 JSON，回應: {text[:400]}")
     return json.loads(match.group(0))
 
 
+def tavily_search(query: str, max_results: int = 10) -> list[dict]:
+    resp = requests.post(
+        "https://api.tavily.com/search",
+        json={
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "max_results": max_results,
+            "search_depth": "basic",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Tavily API 錯誤 {resp.status_code}: {resp.text[:200]}")
+    return resp.json().get("results", [])
+
+
+def arxiv_search(query: str, max_results: int = 20) -> list[dict]:
+    params = urllib.parse.urlencode({
+        "search_query": query,
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    })
+    resp = requests.get(
+        f"https://export.arxiv.org/api/query?{params}",
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"arXiv API 錯誤 {resp.status_code}")
+
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+    root = ET.fromstring(resp.text)
+    papers = []
+    for entry in root.findall("atom:entry", ns):
+        title    = entry.findtext("atom:title", "", ns).strip().replace("\n", " ")
+        summary  = entry.findtext("atom:summary", "", ns).strip().replace("\n", " ")
+        authors  = [a.findtext("atom:name", "", ns) for a in entry.findall("atom:author", ns)]
+        link     = entry.findtext("atom:id", "", ns).strip()
+        arxiv_id = link.split("/abs/")[-1] if "/abs/" in link else ""
+        papers.append({
+            "title":    title,
+            "summary":  summary[:600],
+            "authors":  authors,
+            "arxiv_id": arxiv_id,
+            "url":      link,
+        })
+    return papers
+
+
 def run_news_agent() -> list[dict]:
-    """Agent 1: 搜尋最新科技新聞"""
     print("🔍 [科技新聞 Agent] 啟動中...")
 
-    system_prompt = f"""你是一個科技新聞整理 Agent。請使用 Google Search 搜尋今日最新重要科技新聞。
-回傳嚴格的 JSON 陣列，每筆包含：
+    today = datetime.now().strftime("%Y-%m-%d")
+    raw = tavily_search(f"tech news AI semiconductor {today}", max_results=15)
+
+    search_text = "\n\n".join([
+        f"標題: {r.get('title','')}\n來源: {r.get('url','')}\n摘要: {r.get('content','')[:300]}"
+        for r in raw
+    ])
+
+    system_prompt = f"""你是科技新聞整理 Agent。根據以下搜尋結果，整理成 JSON 陣列。
+每筆包含：
 - title: 新聞標題（繁體中文）
-- source: 新聞來源（英文，例如 TechCrunch）
+- source: 來源網站名稱（英文）
 - summary: 3句以內摘要（繁體中文）
-- tags: 從 ["AI","半導體","科技公司","產品","政策","其他"] 中選1-2個
-- url: 原文連結（若有）
+- tags: 從 ["AI","半導體","科技公司","產品","政策","其他"] 選1-2個
+- url: 原文連結
 
 只回傳 JSON 陣列，不要任何其他文字或 markdown。共 {NEWS_COUNT} 則。"""
 
-    user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}，請搜尋今日最重要科技新聞並整理成 JSON 陣列。"
+    user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。\n\n搜尋結果：\n{search_text}"
 
     text = call_gemini(system_prompt, user_prompt)
     news = parse_json_from_text(text)
@@ -87,20 +144,32 @@ def run_news_agent() -> list[dict]:
 
 
 def run_arxiv_agent() -> list[dict]:
-    """Agent 2: 搜尋 arXiv 最新 AI 論文"""
     print("🔬 [arXiv Agent] 啟動中...")
 
-    system_prompt = f"""你是一個 arXiv AI 論文整理 Agent。請搜尋 arXiv 上最近發布的重要 AI/ML 論文。
-回傳嚴格的 JSON 陣列，每筆包含：
+    raw_papers = arxiv_search(
+        "cat:cs.AI OR cat:cs.LG OR cat:cs.CL OR cat:cs.CV",
+        max_results=20,
+    )
+
+    papers_text = "\n\n".join([
+        f"標題: {p['title']}\n"
+        f"作者: {', '.join(p['authors'][:3])}{' et al.' if len(p['authors']) > 3 else ''}\n"
+        f"arXiv ID: {p['arxiv_id']}\n"
+        f"摘要: {p['summary'][:400]}"
+        for p in raw_papers
+    ])
+
+    system_prompt = f"""你是 arXiv AI 論文整理 Agent。從以下論文中選出最值得關注的，整理成 JSON 陣列。
+每筆包含：
 - title: 英文原標題
 - authors: 作者（最多3人，其餘用 et al.）
-- summary: 2-3句說明貢獻（繁體中文）
-- tags: 從 ["LLM","Vision","RL","Agent","Multimodal","Safety","Reasoning","Other"] 中選1-2個
-- arxiv_id: arXiv ID，例如 2504.12345
+- summary: 2-3句說明論文貢獻（繁體中文）
+- tags: 從 ["LLM","Vision","RL","Agent","Multimodal","Safety","Reasoning","Other"] 選1-2個
+- arxiv_id: arXiv ID（從原資料複製，不要修改）
 
-只回傳 JSON 陣列，不要任何其他文字或 markdown。共 {PAPER_COUNT} 篇。"""
+只回傳 JSON 陣列，不要任何其他文字或 markdown。選出最重要的 {PAPER_COUNT} 篇。"""
 
-    user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}，請搜尋近期 arXiv 最值得關注的 AI 論文並整理成 JSON 陣列。"
+    user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。\n\n最新論文列表：\n{papers_text}"
 
     text = call_gemini(system_prompt, user_prompt)
     papers = parse_json_from_text(text)
@@ -109,7 +178,6 @@ def run_arxiv_agent() -> list[dict]:
 
 
 def send_to_discord(payload: dict) -> bool:
-    """傳送訊息到 Discord Webhook"""
     resp = requests.post(
         DISCORD_WEBHOOK_URL,
         json=payload,
@@ -129,16 +197,15 @@ def build_news_embeds(news_list: list[dict]) -> list[dict]:
     }
     embeds = []
     for item in news_list:
-        tags = item.get("tags", [])
+        tags  = item.get("tags", [])
         color = TAG_COLORS.get(tags[0] if tags else "其他", 0x6B7280)
-        tag_str = "  ".join(f"`{t}`" for t in tags)
         embed = {
-            "title": item.get("title", "無標題")[:256],
+            "title":       item.get("title", "無標題")[:256],
             "description": item.get("summary", "")[:1024],
-            "color": color,
+            "color":       color,
             "fields": [
                 {"name": "來源", "value": item.get("source", "未知")[:256], "inline": True},
-                {"name": "標籤", "value": tag_str or "`其他`", "inline": True},
+                {"name": "標籤", "value": "  ".join(f"`{t}`" for t in tags) or "`其他`", "inline": True},
             ],
         }
         url = item.get("url", "")
@@ -156,17 +223,16 @@ def build_paper_embeds(paper_list: list[dict]) -> list[dict]:
     }
     embeds = []
     for item in paper_list:
-        tags = item.get("tags", [])
-        color = TAG_COLORS.get(tags[0] if tags else "Other", 0x6B7280)
-        tag_str = "  ".join(f"`{t}`" for t in tags)
+        tags     = item.get("tags", [])
+        color    = TAG_COLORS.get(tags[0] if tags else "Other", 0x6B7280)
         arxiv_id = item.get("arxiv_id", "")
         embed = {
-            "title": item.get("title", "No title")[:256],
+            "title":       item.get("title", "No title")[:256],
             "description": item.get("summary", "")[:1024],
-            "color": color,
+            "color":       color,
             "fields": [
                 {"name": "作者", "value": item.get("authors", "Unknown")[:256], "inline": True},
-                {"name": "領域", "value": tag_str or "`Other`", "inline": True},
+                {"name": "領域", "value": "  ".join(f"`{t}`" for t in tags) or "`Other`", "inline": True},
             ],
         }
         if arxiv_id:
@@ -178,14 +244,12 @@ def build_paper_embeds(paper_list: list[dict]) -> list[dict]:
 
 def send_news_report(news_list: list[dict]):
     now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
-    send_to_discord({
-        "embeds": [{
-            "title": "📡  今日科技新聞摘要",
-            "description": f"由 **科技新聞 Agent** 整理，共 {len(news_list)} 則\n🕐 {now_str}",
-            "color": 0x1D4ED8,
-            "footer": {"text": "Powered by Gemini 2.0 Flash + Google Search"},
-        }]
-    })
+    send_to_discord({"embeds": [{
+        "title":       "📡  今日科技新聞摘要",
+        "description": f"由 **科技新聞 Agent** 整理，共 {len(news_list)} 則\n🕐 {now_str}",
+        "color":       0x1D4ED8,
+        "footer":      {"text": "Tavily Search + Gemini 2.0 Flash"},
+    }]})
     time.sleep(0.5)
     embeds = build_news_embeds(news_list)
     for i in range(0, len(embeds), 10):
@@ -195,14 +259,12 @@ def send_news_report(news_list: list[dict]):
 
 def send_papers_report(paper_list: list[dict]):
     now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
-    send_to_discord({
-        "embeds": [{
-            "title": "🔬  arXiv 最新 AI 論文",
-            "description": f"由 **arXiv Agent** 整理，共 {len(paper_list)} 篇\n🕐 {now_str}",
-            "color": 0x7C3AED,
-            "footer": {"text": "Powered by Gemini 2.0 Flash + Google Search"},
-        }]
-    })
+    send_to_discord({"embeds": [{
+        "title":       "🔬  arXiv 最新 AI 論文",
+        "description": f"由 **arXiv Agent** 整理，共 {len(paper_list)} 篇\n🕐 {now_str}",
+        "color":       0x7C3AED,
+        "footer":      {"text": "arXiv Official API + Gemini 2.0 Flash"},
+    }]})
     time.sleep(0.5)
     embeds = build_paper_embeds(paper_list)
     for i in range(0, len(embeds), 10):
@@ -216,19 +278,20 @@ def main():
     print(f"📅  {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}")
     print("=" * 50)
 
-    if not GEMINI_API_KEY:
-        print("❌  找不到 GEMINI_API_KEY，請設定環境變數或 GitHub Secret")
-        return
-    if not DISCORD_WEBHOOK_URL:
-        print("❌  找不到 DISCORD_WEBHOOK_URL，請設定環境變數或 GitHub Secret")
+    missing = []
+    if not GEMINI_API_KEY:      missing.append("GEMINI_API_KEY")
+    if not TAVILY_API_KEY:      missing.append("TAVILY_API_KEY")
+    if not DISCORD_WEBHOOK_URL: missing.append("DISCORD_WEBHOOK_URL")
+    if missing:
+        print(f"❌  缺少環境變數: {', '.join(missing)}")
         return
 
-    news_result = None
+    news_result   = None
     papers_result = None
-    errors = []
+    errors        = []
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        future_news = executor.submit(run_news_agent)
+        future_news   = executor.submit(run_news_agent)
         future_papers = executor.submit(run_arxiv_agent)
         futures = {future_news: "news", future_papers: "papers"}
         for future in as_completed(futures):
@@ -254,13 +317,11 @@ def main():
         print(f"✅  arXiv 論文已傳送（{len(papers_result)} 篇）")
 
     if errors:
-        send_to_discord({
-            "embeds": [{
-                "title": "⚠️  部分 Agent 執行失敗",
-                "description": "\n".join(errors)[:1024],
-                "color": 0xEF4444,
-            }]
-        })
+        send_to_discord({"embeds": [{
+            "title":       "⚠️  部分 Agent 執行失敗",
+            "description": "\n".join(errors)[:1024],
+            "color":       0xEF4444,
+        }]})
 
     print("\n🎉  執行完畢！")
 
