@@ -1,6 +1,6 @@
-name: 雙 Agent 每日資訊整理
+name: Daily News Agent
 
-'on':
+on:
   schedule:
     - cron: '0 1 * * *'
   workflow_dispatch:
@@ -9,18 +9,18 @@ jobs:
   run-agents:
     runs-on: ubuntu-latest
     steps:
-      - name: 取得程式碼
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 設定 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 安裝依賴
+      - name: Install dependencies
         run: pip install requests
 
-      - name: 執行雙 Agent
+      - name: Run agents
         run: python news_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
