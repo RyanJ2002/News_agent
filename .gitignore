@@ -1,0 +1,14 @@
+# 絕對不要上傳這些
+.env
+*.env
+secrets.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 系統檔案
+.DS_Store
+Thumbs.db
