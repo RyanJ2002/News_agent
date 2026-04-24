@@ -1,1 +1,30 @@
+name: 雙 Agent 每日資訊整理
 
+on:
+  schedule:
+    # UTC 01:00 = 台灣時間 09:00（每天早上）
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    # 允許在 GitHub 網頁上手動觸發（方便測試）
+
+jobs:
+  run-agents:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 取得程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝依賴
+        run: pip install requests
+
+      - name: 執行雙 Agent
+        run: python news_agent.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
