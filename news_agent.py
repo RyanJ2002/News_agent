@@ -1,8 +1,12 @@
 """
-雙 Agent 資訊整理機器人 (Tavily + arXiv 官方 API 版)
-- Agent 1: 科技新聞 (Tavily 搜尋 + Gemini 整理)
-- Agent 2: arXiv AI 論文 (arXiv 官方 API + Gemini 整理)
-- 依序執行避免 Gemini 免費版 429 限制
+雙 Agent 資訊整理機器人 (Tavily + arXiv + Groq 版)
+- Agent 1: 科技新聞 (Tavily 搜尋 + Groq 整理)
+- Agent 2: arXiv AI 論文 (arXiv 官方 API + Groq 整理)
+- 結果透過 Discord Webhook 傳送
+
+取得免費 API Key:
+  Groq  : https://console.groq.com
+  Tavily: https://tavily.com
 """
 
 import os
@@ -12,42 +16,48 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 TAVILY_API_KEY      = os.environ.get("TAVILY_API_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 NEWS_COUNT  = 8
 PAPER_COUNT = 8
-MODEL       = "gemini-2.0-flash"
+MODEL       = "llama-3.3-70b-versatile"
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-# ── Gemini ──────────────────────────────────────────────────
+# ── Groq ─────────────────────────────────────────────────────
 
-def call_gemini(system_prompt: str, user_prompt: str) -> str:
-    payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
-    }
+def call_groq(system_prompt: str, user_prompt: str) -> str:
     resp = requests.post(
-        GEMINI_URL,
-        params={"key": GEMINI_API_KEY},
-        json=payload,
-        headers={"Content-Type": "application/json"},
+        GROQ_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "temperature": 0.3,
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        },
         timeout=60,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"Gemini API 錯誤 {resp.status_code}: {resp.text[:300]}")
+        raise RuntimeError(f"Groq API 錯誤 {resp.status_code}: {resp.text[:300]}")
     data = resp.json()
     try:
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        raise RuntimeError(f"無法解析 Gemini 回應: {data}") from e
+        raise RuntimeError(f"無法解析 Groq 回應: {data}") from e
 
 
 def parse_json_from_text(text: str) -> list:
@@ -124,7 +134,7 @@ def run_news_agent() -> list[dict]:
         for r in raw
     ])
 
-    print("🔍 [科技新聞 Agent] Step 2: Gemini 整理中...")
+    print("🔍 [科技新聞 Agent] Step 2: Groq 整理中...")
     system_prompt = f"""你是科技新聞整理 Agent。根據以下搜尋結果整理成 JSON 陣列。
 每筆包含：
 - title: 新聞標題（繁體中文）
@@ -137,7 +147,7 @@ def run_news_agent() -> list[dict]:
 
     user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。\n\n搜尋結果：\n{search_text}"
 
-    text = call_gemini(system_prompt, user_prompt)
+    text = call_groq(system_prompt, user_prompt)
     news = parse_json_from_text(text)
     print(f"✅ [科技新聞 Agent] 完成，取得 {len(news)} 則")
     return news
@@ -161,7 +171,7 @@ def run_arxiv_agent() -> list[dict]:
         for p in raw_papers
     ])
 
-    print("🔬 [arXiv Agent] Step 2: Gemini 整理中...")
+    print("🔬 [arXiv Agent] Step 2: Groq 整理中...")
     system_prompt = f"""你是 arXiv AI 論文整理 Agent。從以下論文中選出最值得關注的，整理成 JSON 陣列。
 每筆包含：
 - title: 英文原標題
@@ -174,7 +184,7 @@ def run_arxiv_agent() -> list[dict]:
 
     user_prompt = f"今天是 {datetime.now().strftime('%Y年%m月%d日')}。\n\n最新論文列表：\n{papers_text}"
 
-    text = call_gemini(system_prompt, user_prompt)
+    text = call_groq(system_prompt, user_prompt)
     papers = parse_json_from_text(text)
     print(f"✅ [arXiv Agent] 完成，取得 {len(papers)} 篇")
     return papers
@@ -253,7 +263,7 @@ def send_news_report(news_list: list[dict]):
         "title":       "📡  今日科技新聞摘要",
         "description": f"由 **科技新聞 Agent** 整理，共 {len(news_list)} 則\n🕐 {now_str}",
         "color":       0x1D4ED8,
-        "footer":      {"text": "Tavily Search + Gemini 2.0 Flash"},
+        "footer":      {"text": "Tavily Search + Groq Llama 3.3 70B"},
     }]})
     time.sleep(0.5)
     embeds = build_news_embeds(news_list)
@@ -268,7 +278,7 @@ def send_papers_report(paper_list: list[dict]):
         "title":       "🔬  arXiv 最新 AI 論文",
         "description": f"由 **arXiv Agent** 整理，共 {len(paper_list)} 篇\n🕐 {now_str}",
         "color":       0x7C3AED,
-        "footer":      {"text": "arXiv Official API + Gemini 2.0 Flash"},
+        "footer":      {"text": "arXiv Official API + Groq Llama 3.3 70B"},
     }]})
     time.sleep(0.5)
     embeds = build_paper_embeds(paper_list)
@@ -286,7 +296,7 @@ def main():
     print("=" * 50)
 
     missing = []
-    if not GEMINI_API_KEY:      missing.append("GEMINI_API_KEY")
+    if not GROQ_API_KEY:        missing.append("GROQ_API_KEY")
     if not TAVILY_API_KEY:      missing.append("TAVILY_API_KEY")
     if not DISCORD_WEBHOOK_URL: missing.append("DISCORD_WEBHOOK_URL")
     if missing:
@@ -297,25 +307,23 @@ def main():
     papers_result = None
     errors        = []
 
-    # ── Agent 1：科技新聞 ──
-    try:
-        news_result = run_news_agent()
-    except Exception as e:
-        errors.append(f"[news] {e}")
-        print(f"⚠️  科技新聞 Agent 錯誤: {e}")
+    # 兩個 Agent 並行執行（Groq 額度充裕，不需要等待）
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_news   = executor.submit(run_news_agent)
+        future_papers = executor.submit(run_arxiv_agent)
+        futures = {future_news: "news", future_papers: "papers"}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                result = future.result()
+                if name == "news":
+                    news_result = result
+                else:
+                    papers_result = result
+            except Exception as e:
+                errors.append(f"[{name}] {e}")
+                print(f"⚠️  Agent 錯誤 ({name}): {e}")
 
-    # 等待 65 秒，避免 Gemini 免費版每分鐘限制
-    print("\n⏳  等待 65 秒讓 Gemini 配額重置...")
-    time.sleep(65)
-
-    # ── Agent 2：arXiv 論文 ──
-    try:
-        papers_result = run_arxiv_agent()
-    except Exception as e:
-        errors.append(f"[papers] {e}")
-        print(f"⚠️  arXiv Agent 錯誤: {e}")
-
-    # ── 傳送到 Discord ──
     print("\n📤  傳送到 Discord...")
 
     if news_result:
