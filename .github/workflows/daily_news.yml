@@ -1,6 +1,6 @@
 name: 雙 Agent 每日資訊整理
 
-"on":
+'on':
   schedule:
     - cron: '0 1 * * *'
   workflow_dispatch:
