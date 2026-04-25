@@ -26,3 +26,15 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+  keep-alive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep workflow alive
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git commit --allow-empty -m "chore: keep workflow alive [skip ci]"
+          git push
